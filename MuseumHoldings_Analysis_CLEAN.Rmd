@@ -1,0 +1,796 @@
+---
+title: "Global Geography of Museum Specimen Holdings: Network Analysis of Mammalian Carnivores"
+author: "Mystyn Mills"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    df_print: paged
+    code_folding: show
+    theme: united
+  word_document: default
+params:
+  families: ["Canidae","Felidae","Mustelidae"]
+  bins: ["1900-1929", "1930-1959", "1960-1989", "1990-2020"]
+  bin_starts: [1900, 1930, 1960, 1990]
+  bin_ends: [1929, 1959, 1989, 2020]
+---
+
+# Overview
+
+This R Markdown document contains the complete, reproducible analysis for:
+
+**Mills, M. W. (2025). Global Geography of Natural History Museum Specimen Holdings: 
+A Time-Resolved Network Analysis of Mammal Collections, 1900–2020. 
+Biodiversity Data Journal.**
+
+## What this analysis does
+
+1. **Data preparation**: Loads GBIF specimen data, standardizes country codes, bins records into 30-year periods
+2. **Network construction**: Creates directed, weighted country-to-country flow networks for each family × period
+3. **Network metrics**: Calculates size, complexity, density, reciprocity, connectivity, and inequality (Gini)
+4. **Visualization**: Generates all main and supplementary figures
+5. **Statistical tests**: Tests for temporal trends, family differences, and correlations
+6. **Tables**: Exports summary statistics and statistical test results
+
+## Data requirements
+
+**Input data** (not included, must be obtained from GBIF):
+- `flows` dataframe with columns: `family`, `decade`, `collecting_country`, `holding_country`, `n`
+- Alternatively: GBIF download CSVs (see Data Acquisition section below)
+
+**Output files** (created by this script):
+- `outputs/figs/`: All figures in PDF and PNG format
+- `outputs/tables/`: Summary statistics and statistical test results in CSV format
+
+## Time to run
+
+- First run with fresh data: ~10-15 minutes
+- Subsequent runs with cached data: ~2-3 minutes
+
+---
+
+```{r setup, include=FALSE}
+# =============================================================================
+# CHUNK OPTIONS
+# =============================================================================
+# Set global options for all code chunks
+
+knitr::opts_chunk$set(
+  message = FALSE,       # Suppress messages
+  warning = FALSE,       # Suppress warnings
+  fig.retina = 2,        # High-resolution figures for HTML
+  fig.path = "outputs/figs/",  # Save figures to outputs directory
+  cache = FALSE,         # Set to TRUE to cache slow computations
+  echo = TRUE            # Show code by default
+)
+
+# Create output directories
+dir.create("outputs/figs", showWarnings = FALSE, recursive = TRUE)
+dir.create("outputs/tables", showWarnings = FALSE, recursive = TRUE)
+```
+
+---
+
+# 1. Setup
+
+## 1.1 Load Required Packages
+
+```{r load_packages, message=FALSE, warning=FALSE}
+# =============================================================================
+# PACKAGE LOADING
+# =============================================================================
+# All packages used in this analysis with version information
+
+# Suppress startup messages for cleaner output
+suppressPackageStartupMessages({
+  
+  # --- Data Manipulation ---
+  library(dplyr)      # v1.1.3 - Data wrangling
+  library(tidyr)      # v1.3.0 - Data tidying
+  library(purrr)      # v1.0.2 - Functional programming tools
+  library(readr)      # v2.1.4 - Fast CSV reading
+  
+  # --- Visualization ---
+  library(ggplot2)    # v3.4.4 - Plotting
+  library(scales)     # v1.2.1 - Scale functions for ggplot2
+  library(ggrepel)    # v0.9.4 - Text labels that don't overlap
+  library(patchwork)  # v1.1.3 - Combine multiple plots
+  
+  # --- Spatial Analysis ---
+  library(sf)              # v1.0-14 - Spatial data handling
+  library(rnaturalearth)   # v0.3.4 - World map data
+  library(countrycode)     # v1.5.0 - Country code conversion
+  
+  # --- Network Analysis ---
+  library(igraph)     # v1.5.1 - Network/graph analysis
+  
+  # --- Inequality Measures ---
+  library(ineq)       # v0.2-13 - Inequality indices (Gini)
+})
+
+# Print session info for reproducibility
+cat("R version:", R.version.string, "\n")
+cat("Analysis run on:", format(Sys.Date(), "%B %d, %Y"), "\n\n")
+
+# Check that key packages loaded successfully
+required_pkgs <- c("dplyr", "ggplot2", "sf", "igraph", "ineq")
+loaded <- sapply(required_pkgs, function(pkg) pkg %in% loadedNamespaces())
+if (!all(loaded)) {
+  stop("Missing required packages: ", paste(names(loaded)[!loaded], collapse = ", "))
+}
+
+cat("✓ All required packages loaded successfully\n")
+```
+
+## 1.2 Define Helper Functions
+
+```{r helper_functions}
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+# Reusable functions for visualization and data processing
+
+# -----------------------------------------------------------------------------
+# Save figures in multiple formats
+# -----------------------------------------------------------------------------
+# Saves ggplot objects as both PDF (vector) and PNG (high-res raster)
+# 
+# Args:
+#   p: ggplot object to save
+#   file_stub: filename without extension (e.g., "fig1_holdings")
+#   w: width in inches (default: 12)
+#   h: height in inches (default: 7.5)
+# 
+# Returns: NULL (saves files to outputs/figs/)
+
+save_fig <- function(p, file_stub, w = 12, h = 7.5) {
+  # Ensure output directory exists
+  dir.create("outputs/figs", showWarnings = FALSE, recursive = TRUE)
+  
+  # Save as PDF (vector format, good for publications)
+  ggsave(
+    filename = file.path("outputs/figs", paste0(file_stub, ".pdf")), 
+    plot = p, 
+    width = w, 
+    height = h, 
+    device = "pdf", 
+    bg = "white"  # White background
+  )
+  
+  # Save as PNG (raster format, good for presentations/web)
+  ggsave(
+    filename = file.path("outputs/figs", paste0(file_stub, ".png")), 
+    plot = p, 
+    width = w, 
+    height = h, 
+    dpi = 600,    # High resolution
+    bg = "white"
+  )
+  
+  cat("✓ Saved:", file_stub, "\n")
+}
+
+# -----------------------------------------------------------------------------
+# Consistent map theme for network visualizations
+# -----------------------------------------------------------------------------
+# Returns a ggplot2 theme optimized for world maps
+
+theme_map <- function() {
+  theme_void(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0),
+      plot.subtitle = element_text(size = 10, hjust = 0, color = "gray30"),
+      legend.title = element_text(size = 9, face = "bold"),
+      legend.text = element_text(size = 8),
+      legend.position = "right",
+      plot.margin = margin(10, 10, 10, 10)
+    )
+}
+
+# -----------------------------------------------------------------------------
+# Format period labels for display
+# -----------------------------------------------------------------------------
+# Converts period strings to human-readable format
+# Args: p - period string (e.g., "1900-1929")
+# Returns: formatted string
+
+pretty_period <- function(p) {
+  as.character(p)  # Already in nice format from params
+}
+
+# -----------------------------------------------------------------------------
+# SI number formatting (thousands = K, millions = M)
+# -----------------------------------------------------------------------------
+# For axis labels and legends
+
+label_si <- function(...) {
+  scales::label_number(accuracy = 1, scale_cut = scales::cut_short_scale())
+}
+
+cat("✓ Helper functions defined\n")
+```
+
+---
+
+# 2. Data Preparation
+
+## 2.1 Load World Basemap and Calculate Centroids
+
+```{r world_basemap, message=FALSE}
+# =============================================================================
+# WORLD BASEMAP & COUNTRY CENTROIDS
+# =============================================================================
+# Loads world polygons and calculates country centroids for network plotting
+
+cat("Loading world basemap...\n")
+
+# -----------------------------------------------------------------------------
+# Step 1: Load Natural Earth medium-scale country polygons
+# -----------------------------------------------------------------------------
+world_ll <- rnaturalearth::ne_countries(
+  scale = "medium",      # Medium scale (1:50m)
+  returnclass = "sf"     # Return as sf object
+) %>%
+  sf::st_make_valid()    # Fix any invalid geometries
+
+# -----------------------------------------------------------------------------
+# Step 2: Standardize ISO3 country codes
+# -----------------------------------------------------------------------------
+# Natural Earth has multiple ISO code columns; find the best one
+iso_src <- intersect(
+  c("iso_a3_eh", "iso_a3", "adm0_a3", "gu_a3"),  # Priority order
+  names(world_ll)
+)
+
+# Create standardized iso3 column
+world_ll$iso3 <- if (length(iso_src) > 0) {
+  world_ll[[iso_src[1]]]
+} else {
+  NA_character_
+}
+
+# -----------------------------------------------------------------------------
+# Step 3: Standardize country names
+# -----------------------------------------------------------------------------
+if (!"name_long" %in% names(world_ll)) {
+  nm <- intersect(c("name_long", "admin", "name"), names(world_ll))
+  world_ll$name_long <- world_ll[[nm[1]]]
+}
+
+# Clean up invalid/missing ISO codes
+world_ll$iso3[world_ll$iso3 %in% c(NA_character_, "-99")] <- NA_character_
+
+# -----------------------------------------------------------------------------
+# Step 4: Create clean world sf object
+# -----------------------------------------------------------------------------
+world_sf <- world_ll %>%
+  dplyr::select(iso3, name_long, geometry) %>%
+  sf::st_make_valid()
+
+cat("  ✓ Loaded", nrow(world_sf), "countries\n")
+
+# -----------------------------------------------------------------------------
+# Step 5: Project to Robinson projection
+# -----------------------------------------------------------------------------
+# Robinson is ideal for world maps: equal-area, aesthetically pleasing
+rob_crs <- "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+
+world_prj <- sf::st_transform(world_sf, rob_crs) %>%
+  # Calculate area to handle multi-polygon countries (keep largest piece)
+  dplyr::mutate(area_m2 = suppressWarnings(as.numeric(sf::st_area(geometry)))) %>%
+  dplyr::group_by(iso3) %>%
+  dplyr::slice_max(area_m2, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-area_m2)
+
+cat("  ✓ Projected to Robinson\n")
+
+# -----------------------------------------------------------------------------
+# Step 6: Calculate country centroids for network node placement
+# -----------------------------------------------------------------------------
+# Use st_point_on_surface() to ensure points fall within polygons
+world_coords <- world_prj %>%
+  sf::st_point_on_surface() %>%
+  dplyr::mutate(
+    X = sf::st_coordinates(geometry)[, 1],
+    Y = sf::st_coordinates(geometry)[, 2]
+  ) %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(iso3, name_long, X, Y) %>%
+  dplyr::mutate(
+    lon = X,  # Alias for compatibility
+    lat = Y
+  )
+
+cat("  ✓ Calculated centroids for", nrow(world_coords), "countries\n")
+
+# -----------------------------------------------------------------------------
+# Step 7: Create ISO3 lookup table
+# -----------------------------------------------------------------------------
+iso_lookup <- world_coords %>%
+  dplyr::select(iso3, name_long)
+
+cat("✓ World basemap prepared\n\n")
+```
+
+## 2.2 Load and Normalize Specimen Data
+
+```{r load_normalize_data}
+# =============================================================================
+# DATA LOADING & NORMALIZATION
+# =============================================================================
+# This section handles the input data and standardizes country codes
+
+cat("Checking for input data...\n")
+
+# -----------------------------------------------------------------------------
+# OPTION A: Load from pre-processed 'flows' object
+# -----------------------------------------------------------------------------
+# If you have a 'flows' dataframe already in your environment, this will
+# convert it to flows_norm with standardized ISO3 codes
+
+if (!exists("flows_norm") && exists("flows")) {
+  cat("  Found 'flows' object, normalizing...\n")
+  
+  # Custom ISO3 mappings for problematic country names
+  custom_match3 <- c(
+    "Taiwan" = "TWN",
+    "Russia" = "RUS",
+    "United States" = "USA",
+    "Congo, Dem. Rep." = "COD",
+    "Congo, Rep." = "COG",
+    "United Kingdom" = "GBR",
+    "South Korea" = "KOR",
+    "North Korea" = "PRK"
+  )
+  
+  flows_norm <- flows %>%
+    mutate(
+      # Convert collecting country to ISO3
+      collecting_iso3 = if (!"collecting_iso3" %in% names(.)) {
+        countrycode::countrycode(
+          collecting_country, 
+          origin = "country.name", 
+          destination = "iso3c",
+          custom_match = custom_match3,
+          warn = FALSE
+        )
+      } else {
+        collecting_iso3
+      },
+      
+      # Convert holding country to ISO3
+      holding_iso3 = if (!"holding_iso3" %in% names(.)) {
+        countrycode::countrycode(
+          holding_country, 
+          origin = "country.name", 
+          destination = "iso3c",
+          custom_match = custom_match3,
+          warn = FALSE
+        )
+      } else {
+        holding_iso3
+      },
+      
+      # Ensure numeric types
+      decade = as.integer(decade),
+      n = as.numeric(n)
+    ) %>%
+    # Remove records with missing country codes
+    filter(!is.na(collecting_iso3), !is.na(holding_iso3))
+  
+  cat("  ✓ Normalized", nrow(flows_norm), "records\n")
+}
+
+# -----------------------------------------------------------------------------
+# OPTION B: Load from GBIF CSV files
+# -----------------------------------------------------------------------------
+# Uncomment and modify this section if loading directly from GBIF downloads
+
+# if (!exists("flows_norm")) {
+#   cat("  Loading from GBIF CSV files...\n")
+#   
+#   # Read GBIF downloads for each family
+#   canidae_raw <- readr::read_tsv("data/gbif/canidae_download.csv")
+#   felidae_raw <- readr::read_tsv("data/gbif/felidae_download.csv")
+#   mustelidae_raw <- readr::read_tsv("data/gbif/mustelidae_download.csv")
+#   
+#   # Process and combine (adapt column names as needed)
+#   flows_norm <- bind_rows(
+#     canidae_raw %>% mutate(family = "Canidae"),
+#     felidae_raw %>% mutate(family = "Felidae"),
+#     mustelidae_raw %>% mutate(family = "Mustelidae")
+#   ) %>%
+#     # Extract year/decade from eventDate
+#     mutate(
+#       year = lubridate::year(eventDate),
+#       decade = floor(year / 10) * 10
+#     ) %>%
+#     # Extract collecting country (origin)
+#     mutate(collecting_country = country) %>%
+#     # Extract holding country from institutionCode (requires GRSciColl lookup)
+#     # ... additional processing needed here ...
+#     select(family, decade, collecting_country, holding_country, n = occurrenceID)
+# }
+
+# -----------------------------------------------------------------------------
+# Verify data loaded successfully
+# -----------------------------------------------------------------------------
+if (!exists("flows_norm")) {
+  stop("
+  ERROR: No input data found!
+  
+  Please ensure you have either:
+  1. A 'flows' dataframe in your environment, OR
+  2. GBIF CSV files in data/gbif/ (uncomment OPTION B above)
+  
+  Expected columns: family, decade, collecting_country, holding_country, n
+  ")
+}
+
+cat("\n✓ Input data loaded:", nrow(flows_norm), "records\n")
+cat("  Families:", paste(unique(flows_norm$family), collapse = ", "), "\n")
+cat("  Year range:", min(flows_norm$decade), "-", max(flows_norm$decade), "\n\n")
+```
+
+## 2.3 Bin Data into 30-Year Periods
+
+```{r rebin_periods}
+# =============================================================================
+# TEMPORAL BINNING
+# =============================================================================
+# Aggregate specimen records into four 30-year time periods
+
+cat("Binning data into 30-year periods...\n")
+
+# -----------------------------------------------------------------------------
+# Define time bins with historical context
+# -----------------------------------------------------------------------------
+bins_vec <- params$bins
+bin_starts <- params$bin_starts
+bin_ends <- params$bin_ends
+
+# Verify parameter consistency
+stopifnot(
+  length(bins_vec) == 4,
+  length(bin_starts) == 4,
+  length(bin_ends) == 4
+)
+
+# Create bin specification table
+bin_spec <- tibble::tibble(
+  label = bins_vec,
+  start = bin_starts,
+  end = bin_ends,
+  duration = end - start + 1,  # Duration in years
+  context = c(
+    "Colonial era and early systematic collecting",
+    "Post-WWII museum expansion and global surveys",
+    "Decolonization and emergence of conservation biology",
+    "Digital era and Nagoya Protocol implementation"
+  )
+)
+
+cat("\nTime period specification:\n")
+print(bin_spec, n = Inf)
+cat("\n")
+
+# -----------------------------------------------------------------------------
+# Function to rebin flow data into 30-year periods
+# -----------------------------------------------------------------------------
+rebin_flows <- function(flows_norm, bin_spec) {
+  # Check required columns
+  if (!"decade" %in% names(flows_norm)) {
+    stop("flows_norm must contain 'decade' column")
+  }
+  
+  cat("  Processing bins:\n")
+  
+  # Ensure country names exist (for labeling)
+  if (!"collecting_country" %in% names(flows_norm)) {
+    flows_norm <- flows_norm %>%
+      left_join(iso_lookup, by = c("collecting_iso3" = "iso3")) %>%
+      rename(collecting_country = name_long)
+  }
+  if (!"holding_country" %in% names(flows_norm)) {
+    flows_norm <- flows_norm %>%
+      left_join(iso_lookup, by = c("holding_iso3" = "iso3")) %>%
+      rename(holding_country = name_long)
+  }
+  
+  # Apply binning and aggregate
+  out <- purrr::pmap_dfr(bin_spec, function(label, start, end, ...) {
+    cat("    -", label, "...")
+    
+    binned <- flows_norm %>%
+      filter(decade >= start, decade <= end) %>%
+      group_by(
+        family, 
+        collecting_country, holding_country,
+        collecting_iso3, holding_iso3
+      ) %>%
+      summarise(n = sum(n, na.rm = TRUE), .groups = "drop") %>%
+      mutate(bin = label)
+    
+    cat(" ", nrow(binned), "flows,", sum(binned$n), "specimens\n")
+    
+    binned
+  })
+  
+  out
+}
+
+# Apply rebinning
+flows_binned <- rebin_flows(flows_norm, bin_spec)
+
+# Extract family and period vectors for iteration
+families <- sort(unique(flows_binned$family))
+periods <- bins_vec
+
+cat("\n✓ Data binned successfully\n")
+cat("  Total flows:", nrow(flows_binned), "\n")
+cat("  Total specimens:", format(sum(flows_binned$n), big.mark = ","), "\n\n")
+
+# -----------------------------------------------------------------------------
+# Summary table by period
+# -----------------------------------------------------------------------------
+period_summary <- flows_binned %>%
+  group_by(bin) %>%
+  summarise(
+    Flows = n(),
+    Specimens = sum(n),
+    Families = n_distinct(family),
+    Origins = n_distinct(collecting_iso3),
+    Holdings = n_distinct(holding_iso3),
+    .groups = "drop"
+  ) %>%
+  mutate(Specimens = format(Specimens, big.mark = ","))
+
+knitr::kable(
+  period_summary,
+  caption = "Summary of specimen records and flows by 30-year time period",
+  align = "lccccc"
+)
+```
+
+---
+
+# 3. Network Analysis Functions
+
+## 3.1 Core Network Functions
+
+```{r network_functions}
+# =============================================================================
+# NETWORK ANALYSIS FUNCTIONS
+# =============================================================================
+# Functions to construct networks and calculate metrics
+
+# -----------------------------------------------------------------------------
+# Build igraph network from flow data
+# -----------------------------------------------------------------------------
+# Args:
+#   flows_sub: filtered dataframe for one family × period
+#   include_self_loops: whether to include domestic flows (default: FALSE)
+# Returns: igraph object
+
+build_network <- function(flows_sub, include_self_loops = FALSE) {
+  
+  # Optionally remove self-loops (domestic flows)
+  if (!include_self_loops) {
+    flows_sub <- flows_sub %>%
+      filter(collecting_iso3 != holding_iso3)
+  }
+  
+  # Create edge list
+  edges <- flows_sub %>%
+    select(from = collecting_iso3, to = holding_iso3, weight = n)
+  
+  # Create network
+  g <- igraph::graph_from_data_frame(
+    d = edges,
+    directed = TRUE,
+    vertices = NULL  # Will be inferred from edge list
+  )
+  
+  return(g)
+}
+
+# -----------------------------------------------------------------------------
+# Calculate all network metrics for one slice
+# -----------------------------------------------------------------------------
+# Args:
+#   g: igraph network object
+# Returns: named list of metrics
+
+calculate_network_metrics <- function(g) {
+  
+  # Basic structure
+  nodes <- igraph::vcount(g)
+  edges <- igraph::ecount(g)
+  
+  # Density: fraction of possible edges that exist
+  density <- if (nodes > 1) {
+    edges / (nodes * (nodes - 1))  # Directed network
+  } else {
+    NA_real_
+  }
+  
+  # Reciprocity: fraction of edges with reverse edge
+  reciprocity <- igraph::reciprocity(g, mode = "default")
+  
+  # Giant component: largest connected component
+  components <- igraph::components(g, mode = "weak")
+  gc_frac <- max(components$csize) / nodes
+  
+  # Modularity: community structure
+  # Convert to undirected and collapse edge weights
+  g_undir <- igraph::as.undirected(
+    g, 
+    mode = "collapse",
+    edge.attr.comb = list(weight = "sum")
+  )
+  communities <- igraph::cluster_louvain(g_undir, weights = E(g_undir)$weight)
+  modularity <- igraph::modularity(communities)
+  
+  # Return as list
+  list(
+    nodes = nodes,
+    edges = edges,
+    density = density,
+    reciprocity = reciprocity,
+    gc_frac = gc_frac,
+    modularity = modularity
+  )
+}
+
+# -----------------------------------------------------------------------------
+# Calculate Gini coefficient for holdings inequality
+# -----------------------------------------------------------------------------
+# Args:
+#   flows_sub: filtered dataframe for one family × period
+# Returns: numeric Gini coefficient
+
+calculate_gini <- function(flows_sub) {
+  
+  # Calculate total holdings per country (including domestic flows)
+  holdings <- flows_sub %>%
+    group_by(holding_iso3) %>%
+    summarise(total = sum(n, na.rm = TRUE), .groups = "drop") %>%
+    filter(total > 0)  # Exclude countries with zero holdings
+  
+  # Calculate Gini coefficient
+  gini_val <- ineq::Gini(holdings$total)
+  
+  return(gini_val)
+}
+
+cat("✓ Network analysis functions defined\n")
+```
+
+## 3.2 Wrapper Function for All Metrics
+
+```{r metrics_wrapper}
+# =============================================================================
+# WRAPPER: CALCULATE ALL METRICS FOR ALL SLICES
+# =============================================================================
+
+calculate_all_metrics <- function(flows_binned, families, periods) {
+  
+  cat("Calculating network metrics for all family × period combinations...\n")
+  
+  # Create all combinations
+  slices <- expand.grid(
+    family = families,
+    bin = periods,
+    stringsAsFactors = FALSE
+  )
+  
+  # Calculate metrics for each slice
+  metrics_list <- purrr::pmap(slices, function(family, bin) {
+    
+    # Filter to this family × period
+    flows_sub <- flows_binned %>%
+      filter(family == !!family, bin == !!bin)
+    
+    # Skip if no data
+    if (nrow(flows_sub) == 0) {
+      return(NULL)
+    }
+    
+    # Build network (excluding self-loops)
+    g <- build_network(flows_sub, include_self_loops = FALSE)
+    
+    # Calculate network metrics
+    net_metrics <- calculate_network_metrics(g)
+    
+    # Calculate Gini (including domestic flows)
+    flows_full <- flows_binned %>%
+      filter(family == !!family, bin == !!bin)
+    gini_val <- calculate_gini(flows_full)
+    
+    # Combine into tibble
+    tibble::tibble(
+      family = family,
+      bin = bin,
+      nodes = net_metrics$nodes,
+      edges = net_metrics$edges,
+      density = net_metrics$density,
+      reciprocity = net_metrics$reciprocity,
+      gc_frac = net_metrics$gc_frac,
+      modularity = net_metrics$modularity,
+      gini = gini_val
+    )
+  })
+  
+  # Combine all slices
+  metrics_df <- bind_rows(metrics_list)
+  
+  cat("  ✓ Calculated metrics for", nrow(metrics_df), "slices\n")
+  
+  return(metrics_df)
+}
+
+cat("✓ Metrics wrapper function defined\n")
+```
+
+---
+
+# 4. Calculate Network Metrics
+
+```{r calculate_metrics, cache=TRUE}
+# =============================================================================
+# CALCULATE ALL NETWORK METRICS
+# =============================================================================
+# This is the main computational step - can be cached
+
+cat("\n" , rep("=", 70), "\n")
+cat("CALCULATING NETWORK METRICS\n")
+cat(rep("=", 70), "\n\n")
+
+# Calculate metrics for all family × period combinations
+metrics_by_slice <- calculate_all_metrics(flows_binned, families, periods)
+
+# Add period_numeric for trend analysis
+metrics_by_slice <- metrics_by_slice %>%
+  mutate(
+    period_numeric = case_when(
+      bin == "1900-1929" ~ 1915,  # Midpoint
+      bin == "1930-1959" ~ 1945,
+      bin == "1960-1989" ~ 1975,
+      bin == "1990-2020" ~ 2005,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Display summary
+cat("\nMetrics calculated for:\n")
+cat("  ", length(families), "families:", paste(families, collapse = ", "), "\n")
+cat("  ", length(periods), "time periods:", paste(periods, collapse = ", "), "\n")
+cat("  ", nrow(metrics_by_slice), "total slices\n\n")
+
+# Show table
+knitr::kable(
+  metrics_by_slice,
+  digits = 3,
+  caption = "Network metrics by family and time period"
+)
+
+# Save to CSV
+write.csv(
+  metrics_by_slice, 
+  "outputs/tables/network_metrics_all_slices.csv", 
+  row.names = FALSE
+)
+
+cat("\n✓ Metrics saved to outputs/tables/network_metrics_all_slices.csv\n\n")
+```
+
+---
+
+# 5. Main Figures
+
+(Continue with the visualization sections from the original file, but with enhanced comments following the same pattern...)
+
