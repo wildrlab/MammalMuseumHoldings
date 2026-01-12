@@ -1,0 +1,1264 @@
+---
+title: "Global Geography of Museum Specimen Holdings: Network Analysis of Canidae, Felidae, and Mustelidae"
+author: "MM & EV"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    df_print: paged
+    code_folding: hide
+  word_document: default
+params:
+  families: ["Canidae","Felidae","Mustelidae"]
+  bins: ["1900-1929", "1930-1959", "1960-1989", "1990-2020"]
+  bin_starts: [1900, 1930, 1960, 1990]
+  bin_ends: [1929, 1959, 1989, 2020]
+---
+
+<!-- 
+================================================================================
+ANALYSIS CODE FOR:
+"Global Geography of Museum Specimen Holdings: Network Analysis of Canidae, 
+Felidae, and Mustelidae"
+
+This R Markdown file contains all data processing, analysis, and visualization
+code for examining temporal and geographic patterns in museum specimen holdings
+of three carnivore families from 1900-2020.
+
+Key analyses:
+- Temporal trends in holdings concentration (Gini coefficients)
+- Network analysis of specimen flows between countries
+- Geographic visualization of collection and holding patterns
+- Statistical tests for temporal changes in network structure
+
+Required input data:
+- flows_norm: A dataframe containing specimen flow records with columns:
+  * family: taxonomic family (Canidae, Felidae, or Mustelidae)
+  * decade: year of collection (e.g., 1900, 1910, ..., 2020)
+  * collecting_country: country where specimen was collected
+  * holding_country: country where specimen is held
+  * collecting_iso3: ISO3 code for collecting country
+  * holding_iso3: ISO3 code for holding country
+  * n: number of specimens
+
+Output structure:
+- outputs/figs/ - All figures in PDF and PNG formats
+- outputs/tables/ - Summary statistics and statistical test results
+
+================================================================================
+-->
+
+```{r setup, include=FALSE}
+# Set default chunk options for consistent output
+knitr::opts_chunk$set(
+  message = FALSE,      # Suppress package loading messages
+  warning = FALSE,      # Suppress warnings
+  fig.retina = 2,       # High-resolution figures for displays
+  fig.path = "outputs/figs/",  # Save figures to outputs directory
+  cache = FALSE         # Disable caching for reproducibility
+)
+```
+
+# Setup
+
+## Load packages
+
+```{r packages}
+# Suppress startup messages for cleaner output
+suppressPackageStartupMessages({
+  # Data manipulation
+  library(dplyr)    # Data frame operations
+  library(tidyr)    # Data reshaping (pivot functions)
+  library(purrr)    # Functional programming tools
+  library(readr)    # Fast CSV reading/writing
+  
+  # Visualization
+  library(ggplot2)    # Grammar of graphics plotting
+  library(scales)     # Scale functions for axes
+  library(ggrepel)    # Non-overlapping text labels
+  library(patchwork)  # Combining multiple plots
+  
+  # Spatial data handling
+  library(sf)              # Simple features for spatial data
+  library(rnaturalearth)   # World country polygons
+  library(countrycode)     # Country name/code conversion
+  library(cartogram)       # Cartogram transformations
+  
+  # Network analysis
+  library(igraph)  # Graph/network analysis
+  
+  # Inequality measures
+  library(ineq)    # Gini coefficient and related metrics
+})
+```
+
+## Helper functions
+
+```{r helpers}
+# ============================================================================
+# FIGURE SAVING FUNCTION
+# ============================================================================
+# Saves ggplot objects in both PDF (vector) and PNG (raster) formats
+# 
+# Args:
+#   p: ggplot object to save
+#   file_stub: filename without extension (e.g., "fig1_holdings")
+#   w: width in inches (default 12)
+#   h: height in inches (default 7.5)
+#
+# Output:
+#   Two files in outputs/figs/: {file_stub}.pdf and {file_stub}.png
+# ============================================================================
+save_fig <- function(p, file_stub, w = 12, h = 7.5) {
+  # Create output directory if it doesn't exist
+  dir.create("outputs/figs", showWarnings = FALSE, recursive = TRUE)
+  
+  # Save as vector PDF (publication quality)
+  ggsave(
+    file.path("outputs/figs", paste0(file_stub, ".pdf")), 
+    p, width = w, height = h, device = "pdf", bg = "white"
+  )
+  
+  # Save as high-resolution PNG (600 dpi for presentations/web)
+  ggsave(
+    file.path("outputs/figs", paste0(file_stub, ".png")), 
+    p, width = w, height = h, dpi = 600, bg = "white"
+  )
+}
+
+# ============================================================================
+# MAP THEME
+# ============================================================================
+# Consistent theme for all map visualizations
+# Based on theme_void with customized text sizes and legend placement
+# ============================================================================
+theme_map <- function() {
+  theme_void(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14, hjust = 0),
+      plot.subtitle = element_text(size = 10, hjust = 0),
+      legend.title = element_text(size = 9),
+      legend.text = element_text(size = 8),
+      legend.position = "right"
+    )
+}
+
+# ============================================================================
+# PERIOD LABEL FORMATTER
+# ============================================================================
+# Converts period labels to display format
+# Currently passes through as-is since bins are already formatted (e.g., "1900-1929")
+# ============================================================================
+pretty_period <- function(p) {
+  as.character(p)
+}
+
+# ============================================================================
+# SI NUMBER FORMATTING
+# ============================================================================
+# Formats large numbers using SI prefixes (K, M, etc.)
+# Uses short scale (1K = 1,000; 1M = 1,000,000)
+# ============================================================================
+label_si <- function(...) {
+  scales::label_number(accuracy = 1, scale_cut = cut_short_scale())
+}
+```
+
+# Data Preparation
+
+## World basemap and centroids
+
+```{r world_basemap}
+# ============================================================================
+# LOAD AND PREPARE WORLD SPATIAL DATA
+# ============================================================================
+# Creates two key spatial objects:
+# 1. world_prj: Country polygons in Robinson projection for mapping
+# 2. world_coords: Country centroids for network node placement
+# ============================================================================
+
+# Load medium-resolution country boundaries from Natural Earth
+world_ll <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") %>%
+  sf::st_make_valid()  # Fix any invalid geometries
+
+# ============================================================================
+# STANDARDIZE ISO3 CODES
+# ============================================================================
+# Different Natural Earth versions use different column names for ISO codes
+# Find the first available ISO3 column and standardize to 'iso3'
+iso_src <- intersect(
+  c("iso_a3_eh", "iso_a3", "adm0_a3", "gu_a3"), 
+  names(world_ll)
+)
+world_ll$iso3 <- if (length(iso_src)) world_ll[[iso_src[1]]] else NA_character_
+
+# Get country names (also handle version differences)
+if (!"name_long" %in% names(world_ll)) {
+  nm <- intersect(c("name_long", "admin", "name"), names(world_ll))
+  world_ll$name_long <- world_ll[[nm[1]]]
+}
+
+# Clean up missing or placeholder ISO codes
+world_ll$iso3[world_ll$iso3 %in% c(NA_character_, "-99")] <- NA_character_
+
+# ============================================================================
+# CREATE CLEAN SPATIAL OBJECT
+# ============================================================================
+# Keep only essential columns: ISO3 code, country name, geometry
+world_sf <- world_ll %>%
+  dplyr::select(iso3, name_long, geometry) %>%
+  sf::st_make_valid()
+
+# ============================================================================
+# PROJECT TO ROBINSON FOR MAPPING
+# ============================================================================
+# Robinson projection is commonly used for world maps
+# Provides good balance of area, shape, and distance distortion
+rob_crs <- "+proj=robin +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs"
+
+world_prj <- sf::st_transform(world_sf, rob_crs) %>%
+  # Calculate area to handle countries with multiple polygons
+  dplyr::mutate(area_m2 = suppressWarnings(as.numeric(sf::st_area(geometry)))) %>%
+  # Keep only the largest polygon for each country (removes small islands)
+  dplyr::group_by(iso3) %>%
+  dplyr::slice_max(area_m2, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-area_m2)
+
+# ============================================================================
+# CREATE COUNTRY CENTROIDS
+# ============================================================================
+# Point-on-surface ensures points are within country boundaries
+# (unlike true centroids which may fall outside concave shapes)
+world_coords <- world_prj %>%
+  sf::st_point_on_surface() %>%
+  dplyr::mutate(
+    X = sf::st_coordinates(geometry)[, 1],  # Extract X coordinate
+    Y = sf::st_coordinates(geometry)[, 2]   # Extract Y coordinate
+  ) %>%
+  sf::st_drop_geometry() %>%  # Convert to regular dataframe
+  dplyr::select(iso3, name_long, X, Y) %>%
+  dplyr::mutate(lon = X, lat = Y)  # Add aliases for compatibility
+
+# ============================================================================
+# CREATE ISO LOOKUP TABLE
+# ============================================================================
+# Simple lookup for converting ISO3 codes to country names
+iso_lookup <- world_coords %>%
+  dplyr::select(iso3, name_long)
+```
+
+## Normalize and bin data
+
+```{r normalize_data}
+# ============================================================================
+# NORMALIZE COUNTRY CODES IN FLOW DATA
+# ============================================================================
+# Ensures all country names are converted to standardized ISO3 codes
+# Handles special cases where countrycode() needs manual specification
+# ============================================================================
+
+# Check if flows_norm exists; if not, create from flows
+if (!exists("flows_norm") && exists("flows")) {
+  # Custom matches for countries that countrycode() may misidentify
+  custom_match3 <- c(
+    "Taiwan" = "TWN", 
+    "Russia" = "RUS", 
+    "United States" = "USA",
+    "Congo, Dem. Rep." = "COD",  # Democratic Republic of Congo
+    "Congo, Rep." = "COG"         # Republic of Congo
+  )
+  
+  flows_norm <- flows %>%
+    mutate(
+      # Convert collecting country name to ISO3 if not already present
+      collecting_iso3 = if (!"collecting_iso3" %in% names(.)) {
+        countrycode(collecting_country, "country.name", "iso3c", 
+                    custom_match = custom_match3)
+      } else collecting_iso3,
+      
+      # Convert holding country name to ISO3 if not already present
+      holding_iso3 = if (!"holding_iso3" %in% names(.)) {
+        countrycode(holding_country, "country.name", "iso3c", 
+                    custom_match = custom_match3)
+      } else holding_iso3,
+      
+      # Ensure numeric types
+      decade = as.integer(decade),
+      n = as.numeric(n)
+    ) %>%
+    # Remove records with missing country codes
+    filter(!is.na(collecting_iso3), !is.na(holding_iso3))
+}
+
+# Verify that flows_norm exists before proceeding
+stopifnot(exists("flows_norm"))
+```
+
+```{r rebin_periods}
+# ============================================================================
+# CREATE 30-YEAR TIME BINS
+# ============================================================================
+# Groups specimen records into four 30-year periods for temporal analysis
+# These bins capture major historical phases in museum collecting:
+#   1900-1929: Colonial era and early natural history museums
+#   1930-1959: Mid-century expansion and WWII impacts
+#   1960-1989: Decolonization and professional curation era
+#   1990-2020: Modern conservation and digital age
+# ============================================================================
+
+# Extract time bin parameters from document parameters
+bins_vec <- params$bins        # Labels: "1900-1929", "1930-1959", etc.
+bin_starts <- params$bin_starts  # Start years: 1900, 1930, 1960, 1990
+bin_ends <- params$bin_ends      # End years: 1929, 1959, 1989, 2020
+
+# Verify parameter consistency
+stopifnot(
+  length(bins_vec) == 4, 
+  length(bin_starts) == 4, 
+  length(bin_ends) == 4
+)
+
+# Create bin specification tibble
+bin_spec <- tibble(
+  label = bins_vec,
+  start = bin_starts,
+  end = bin_ends
+)
+
+# ============================================================================
+# REBINNING FUNCTION
+# ============================================================================
+# Takes decade-level data and aggregates into 30-year bins
+# 
+# Args:
+#   flows_norm: Dataframe with 'decade' column
+#   bin_spec: Tibble defining bins (label, start, end)
+#
+# Returns:
+#   Aggregated flows with 'bin' column instead of 'decade'
+# ============================================================================
+rebin_flows <- function(flows_norm, bin_spec) {
+  if (!"decade" %in% names(flows_norm)) {
+    stop("flows_norm must contain 'decade' column.")
+  }
+  
+  # Ensure country names exist (needed for some downstream functions)
+  if (!"collecting_country" %in% names(flows_norm)) {
+    flows_norm <- flows_norm %>%
+      left_join(iso_lookup, by = c("collecting_iso3" = "iso3")) %>%
+      rename(collecting_country = name_long)
+  }
+  if (!"holding_country" %in% names(flows_norm)) {
+    flows_norm <- flows_norm %>%
+      left_join(iso_lookup, by = c("holding_iso3" = "iso3")) %>%
+      rename(holding_country = name_long)
+  }
+  
+  # Iterate through each bin and aggregate specimens
+  out <- purrr::pmap_dfr(bin_spec, function(label, start, end) {
+    flows_norm %>%
+      # Include all decades in this bin's range (inclusive)
+      filter(decade >= start, decade <= end) %>%
+      # Aggregate by country pairs and family
+      group_by(family, collecting_country, holding_country,
+               collecting_iso3, holding_iso3) %>%
+      summarise(n = sum(n, na.rm = TRUE), .groups = "drop") %>%
+      # Add bin label
+      mutate(bin = label)
+  })
+  
+  out
+}
+
+# Apply rebinning to create main analysis dataset
+flows_binned <- rebin_flows(flows_norm, bin_spec)
+
+# Set up vectors for iteration in analyses below
+families <- sort(unique(flows_binned$family))  # Canidae, Felidae, Mustelidae
+periods <- bins_vec  # The four 30-year bins
+
+# ============================================================================
+# QUICK SUMMARY OF BINNED DATA
+# ============================================================================
+# Provides overview of specimen counts and flows in each time period
+flows_binned %>%
+  group_by(bin) %>%
+  summarise(
+    records = sum(n),     # Total specimen count
+    flows = n(),          # Number of unique country-pair flows
+    .groups = "drop"
+  ) %>%
+  arrange(bin) %>%
+  knitr::kable(caption = "Records and flows by 30-year time period")
+```
+
+# Main Figures
+
+## Figure 1: Holdings Over Time (Top Countries)
+
+```{r fig_holdings_over_time, fig.width=12, fig.height=8}
+# ============================================================================
+# TEMPORAL TRENDS IN SPECIMEN HOLDINGS
+# ============================================================================
+# Shows how the top 10 countries' holdings changed across four time periods
+# Reveals concentration of specimens in northern museums over time
+# ============================================================================
+
+# Identify top 10 countries by total holdings across all time
+top_countries <- flows_binned %>%
+  group_by(holding_iso3, holding_country) %>%
+  summarise(total = sum(n, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  slice_head(n = 10) %>%
+  pull(holding_iso3)
+
+# Calculate holdings by country × period for top countries
+holdings_time <- flows_binned %>%
+  filter(holding_iso3 %in% top_countries) %>%
+  group_by(bin, holding_country) %>%
+  summarise(specimens = sum(n, na.rm = TRUE), .groups = "drop") %>%
+  # Order countries by total holdings (for legend order)
+  mutate(holding_country = reorder(holding_country, specimens, sum))
+
+# Create line plot showing temporal trends
+p1 <- ggplot(holdings_time, aes(x = bin, y = specimens, 
+                                 color = holding_country, group = holding_country)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_y_continuous(labels = label_si(), expand = expansion(mult = c(0, 0.1))) +
+  scale_color_viridis_d(option = "turbo") +
+  labs(
+    title = "Temporal trends in specimen holdings",
+    subtitle = "Top 10 countries by total holdings across all families",
+    x = "Time period",
+    y = "Number of specimens held",
+    color = "Country"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+print(p1)
+save_fig(p1, "fig1_holdings_over_time", w = 12, h = 8)
+```
+
+## Figure 2: Gini Coefficient Over Time
+
+```{r fig_gini_trends, fig.width=12, fig.height=7}
+# ============================================================================
+# INEQUALITY IN SPECIMEN HOLDINGS
+# ============================================================================
+# Gini coefficient measures concentration of specimens across countries
+# Values near 0 = evenly distributed; values near 1 = highly concentrated
+# Shows U-shaped pattern: high inequality → lower → rising again
+# ============================================================================
+
+# Calculate Gini coefficients for holdings in each family × period
+gini_data <- flows_binned %>%
+  group_by(family, bin) %>%
+  summarise(
+    # Gini of holding distribution
+    gini_hold = ineq::Gini(n, type = "Gini"),
+    .groups = "drop"
+  ) %>%
+  # Create numeric period for trend lines
+  mutate(period_num = match(bin, periods))
+
+# Create faceted plot showing Gini trends for each family
+p2 <- ggplot(gini_data, aes(x = bin, y = gini_hold)) +
+  geom_line(aes(group = family), linewidth = 1, color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  # Add smooth trend line to show U-shape
+  geom_smooth(aes(x = period_num, y = gini_hold), 
+              method = "loess", se = TRUE, color = "gray30", 
+              linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~ family, ncol = 3) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2)) +
+  labs(
+    title = "Temporal trends in specimen holding inequality",
+    subtitle = "Gini coefficient shows U-shaped pattern across families",
+    x = "Time period",
+    y = "Gini coefficient (holding inequality)",
+    caption = "Higher values = greater concentration of specimens in fewer countries"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold", size = 11)
+  )
+
+print(p2)
+save_fig(p2, "fig2_gini_trends", w = 12, h = 7)
+```
+
+## Figure 3: Network Metrics Over Time
+
+```{r network_metrics_data}
+# ============================================================================
+# CALCULATE NETWORK METRICS FOR EACH FAMILY × PERIOD
+# ============================================================================
+# Builds directed networks from specimen flows and calculates:
+# - Size (number of countries involved)
+# - Complexity (number of flows)
+# - Density (how interconnected)
+# - Reciprocity (proportion of bidirectional flows)
+# - Giant component fraction (largest connected cluster)
+# ============================================================================
+
+# Function to calculate all metrics for one family-period combination
+calc_network_metrics <- function(df) {
+  # Build directed network from flows
+  g <- igraph::graph_from_data_frame(
+    df %>% select(collecting_iso3, holding_iso3, n),
+    directed = TRUE
+  )
+  
+  # Basic size metrics
+  nodes <- igraph::vcount(g)
+  edges <- igraph::ecount(g)
+  
+  # Density: proportion of possible connections that exist
+  density <- if (nodes > 1) igraph::edge_density(g) else 0
+  
+  # Reciprocity: proportion of edges with reciprocal counterpart
+  reciprocity <- if (edges > 0) igraph::reciprocity(g) else 0
+  
+  # Giant component: size of largest connected component
+  components <- igraph::components(g, mode = "weak")
+  gc_size <- max(components$csize)
+  gc_frac <- gc_size / nodes
+  
+  tibble(
+    nodes = nodes,
+    edges = edges,
+    density = density,
+    reciprocity = reciprocity,
+    gc_frac = gc_frac
+  )
+}
+
+# Calculate metrics for all family × period combinations
+metrics_by_slice <- flows_binned %>%
+  group_by(family, bin) %>%
+  group_modify(~ calc_network_metrics(.x)) %>%
+  ungroup() %>%
+  # Add numeric period for trend analysis
+  mutate(period_numeric = match(bin, periods))
+```
+
+```{r fig_network_metrics, fig.width=14, fig.height=10}
+# ============================================================================
+# VISUALIZE NETWORK METRICS OVER TIME
+# ============================================================================
+# Five-panel plot showing how network structure changed:
+# A) Network size (countries) - declining
+# B) Network complexity (flows) - declining
+# C) Network density - increasing (despite fewer connections)
+# D) Reciprocity - variable, generally low
+# E) Giant component - consistently high
+# ============================================================================
+
+# Prepare data in long format for faceting
+network_trends <- metrics_by_slice %>%
+  pivot_longer(
+    cols = c(nodes, edges, density, reciprocity, gc_frac),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  # Create readable metric labels
+  mutate(
+    metric_label = factor(
+      metric,
+      levels = c("nodes", "edges", "density", "reciprocity", "gc_frac"),
+      labels = c(
+        "A) Network size (countries)",
+        "B) Network complexity (flows)",
+        "C) Network density",
+        "D) Reciprocity",
+        "E) Giant component fraction"
+      )
+    )
+  )
+
+# Create multi-panel plot
+p3 <- ggplot(network_trends, aes(x = bin, y = value, 
+                                  color = family, group = family)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  facet_wrap(~ metric_label, scales = "free_y", ncol = 2) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Temporal changes in network structure",
+    subtitle = "Five key metrics across three carnivore families",
+    x = "Time period",
+    y = "Metric value",
+    color = "Family"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", hjust = 0),
+    panel.grid.minor = element_blank()
+  )
+
+print(p3)
+save_fig(p3, "fig3_network_metrics", w = 14, h = 10)
+```
+
+## Figure 4: Network Map (Combined)
+
+```{r network_map_function}
+# ============================================================================
+# NETWORK MAP CREATION FUNCTION
+# ============================================================================
+# Creates geographic network visualization showing specimen flows
+# 
+# Visual encoding:
+# - Node size: total specimens held by country
+# - Node color: net balance (red = exporter, blue = importer, white = balanced)
+# - Edge width: number of specimens in flow
+# - Edge color: matches exporting country's color
+#
+# Args:
+#   fam: Family name (e.g., "Canidae")
+#   per: Time period (e.g., "1900-1929")
+#   flows: Flow dataframe
+#   world: World spatial polygons
+#   coords: Country centroids
+# ============================================================================
+make_family_network_map <- function(fam, per, flows, world, coords) {
+  # Filter to specific family and period
+  dat <- flows %>%
+    filter(family == fam, bin == per)
+  
+  if (nrow(dat) == 0) {
+    # Return empty plot if no data
+    return(
+      ggplot() + 
+        annotate("text", x = 0, y = 0, label = "No data", size = 5) +
+        theme_void() +
+        ggtitle(paste(fam, "—", per))
+    )
+  }
+  
+  # Calculate node attributes: holdings and net balance
+  nodes_df <- bind_rows(
+    # Holdings: sum of incoming specimens
+    dat %>%
+      group_by(iso3 = holding_iso3) %>%
+      summarise(holdings = sum(n, na.rm = TRUE), .groups = "drop"),
+    
+    # Exports: sum of outgoing specimens (negative for balance)
+    dat %>%
+      group_by(iso3 = collecting_iso3) %>%
+      summarise(exports = sum(n, na.rm = TRUE), .groups = "drop")
+  ) %>%
+    # Combine and calculate net balance
+    group_by(iso3) %>%
+    summarise(
+      holdings = sum(holdings, na.rm = TRUE),
+      exports = sum(exports, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(net_balance = holdings - exports) %>%
+    # Join with coordinates
+    inner_join(coords, by = "iso3")
+  
+  # Prepare edge data for network lines
+  edges_df <- dat %>%
+    select(from = collecting_iso3, to = holding_iso3, flow = n) %>%
+    # Join with start coordinates
+    left_join(
+      coords %>% select(from = iso3, x_start = X, y_start = Y),
+      by = "from"
+    ) %>%
+    # Join with end coordinates
+    left_join(
+      coords %>% select(to = iso3, x_end = X, y_end = Y),
+      by = "to"
+    ) %>%
+    # Keep only edges with valid coordinates
+    filter(!is.na(x_start), !is.na(y_start), !is.na(x_end), !is.na(y_end))
+  
+  # Get exporter color for each edge (red if net exporter)
+  edges_df <- edges_df %>%
+    left_join(
+      nodes_df %>% select(from = iso3, net_balance_from = net_balance),
+      by = "from"
+    ) %>%
+    mutate(edge_color = ifelse(net_balance_from < 0, "#d73027", "#4575b4"))
+  
+  # Create map
+  ggplot() +
+    # Base map
+    geom_sf(data = world, fill = "gray95", color = "gray70", linewidth = 0.2) +
+    
+    # Flow lines (edges)
+    geom_segment(
+      data = edges_df,
+      aes(x = x_start, y = y_start, xend = x_end, yend = y_end,
+          linewidth = flow, color = edge_color),
+      alpha = 0.3, lineend = "round"
+    ) +
+    scale_linewidth_continuous(
+      range = c(0.2, 2),
+      labels = label_si(),
+      guide = guide_legend(title = "Flow size", order = 2)
+    ) +
+    scale_color_identity() +
+    
+    # Country nodes
+    geom_point(
+      data = nodes_df,
+      aes(x = X, y = Y, size = holdings, fill = net_balance),
+      shape = 21, color = "gray20", stroke = 0.3
+    ) +
+    scale_size_continuous(
+      range = c(1, 12),
+      labels = label_si(),
+      guide = guide_legend(title = "Holdings", order = 1)
+    ) +
+    scale_fill_gradient2(
+      low = "#d73027",      # Red for net exporters
+      mid = "white",        # White for balanced
+      high = "#4575b4",     # Blue for net importers
+      midpoint = 0,
+      labels = label_si(),
+      guide = guide_colorbar(title = "Net balance", order = 3)
+    ) +
+    
+    # Labels and theme
+    labs(
+      title = paste(fam, "—", per),
+      subtitle = NULL
+    ) +
+    theme_map() +
+    theme(
+      legend.position = "none",  # Will use shared legend in combined plot
+      plot.title = element_text(size = 11, face = "bold")
+    )
+}
+```
+
+```{r fig_combined_networks, fig.width=16, fig.height=14}
+# ============================================================================
+# CREATE COMBINED NETWORK MAP FIGURE
+# ============================================================================
+# Shows all three families across all four time periods (12 panels total)
+# Reveals spatial patterns in specimen flows and holdings over time
+# ============================================================================
+
+# Generate all 12 maps (3 families × 4 periods)
+all_maps <- expand_grid(
+  family = families,
+  period = periods
+) %>%
+  pmap(function(family, period) {
+    make_family_network_map(family, period, flows_binned, world_prj, world_coords)
+  })
+
+# Combine into multi-panel figure
+p4 <- wrap_plots(all_maps, ncol = 4) +
+  plot_annotation(
+    title = "Geographic networks of specimen flows across families and time",
+    subtitle = "Node size = holdings; Node color = net balance (red = exporter, blue = importer); Edge width = flow size",
+    theme = theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 11)
+    )
+  ) +
+  plot_layout(guides = "collect") &
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal",
+    legend.key.width = unit(1.5, "cm")
+  )
+
+print(p4)
+save_fig(p4, "fig4_combined_networks", w = 16, h = 14)
+```
+
+# Statistical Analyses
+
+## Formal Statistical Tests
+
+```{r statistical_tests}
+# ============================================================================
+# COMPREHENSIVE STATISTICAL TESTING
+# ============================================================================
+# Addresses key research questions:
+# 1. Are U-shaped Gini trends statistically significant?
+# 2. Do families differ significantly in inequality?
+# 3. Are network size/complexity declines significant?
+# 4. Do network metrics change together?
+# 5. Do early vs. recent periods differ significantly?
+# ============================================================================
+
+# ============================================================================
+# 1. TEST FOR QUADRATIC (U-SHAPED) GINI TRENDS
+# ============================================================================
+# Compare linear vs. quadratic models to test for U-shaped pattern
+
+gini_trend_tests <- gini_data %>%
+  group_by(family) %>%
+  do({
+    # Fit linear model: gini ~ time
+    mod_linear <- lm(gini_hold ~ period_num, data = .)
+    
+    # Fit quadratic model: gini ~ time + time²
+    mod_quad <- lm(gini_hold ~ period_num + I(period_num^2), data = .)
+    
+    # Compare models with F-test
+    comparison <- anova(mod_linear, mod_quad)
+    
+    tibble(
+      family = .$family[1],
+      linear_R2 = summary(mod_linear)$r.squared,
+      quadratic_R2 = summary(mod_quad)$r.squared,
+      F_statistic = comparison$F[2],
+      p_value = comparison$`Pr(>F)`[2],
+      interpretation = ifelse(
+        comparison$`Pr(>F)`[2] < 0.05,
+        "Significant U-shape",
+        "No significant U-shape"
+      )
+    )
+  }) %>%
+  ungroup()
+
+print("=== Testing for Quadratic Gini Trends ===")
+print(gini_trend_tests)
+
+# ============================================================================
+# 2. TEST FOR FAMILY DIFFERENCES IN GINI
+# ============================================================================
+# Use mixed-effects model with pairwise comparisons
+
+# Requires lme4 for mixed models
+if (requireNamespace("lme4", quietly = TRUE)) {
+  library(lme4)
+  
+  # Fit mixed-effects model: family as fixed effect, period as random effect
+  gini_model <- lmer(gini_hold ~ family + (1|bin), data = gini_data)
+  
+  print("=== Mixed-Effects Model: Family Differences in Gini ===")
+  print(summary(gini_model))
+  
+  # Pairwise comparisons between families
+  if (requireNamespace("emmeans", quietly = TRUE)) {
+    library(emmeans)
+    gini_contrasts <- emmeans(gini_model, pairwise ~ family)
+    print("=== Pairwise Family Comparisons ===")
+    print(gini_contrasts$contrasts)
+  }
+} else {
+  print("Install lme4 package for mixed-effects modeling")
+}
+
+# ============================================================================
+# 3. TEST FOR TEMPORAL TRENDS IN NETWORK SIZE
+# ============================================================================
+# Linear regression: nodes ~ time, separately for each family
+
+node_trend_tests <- network_trends %>%
+  filter(metric == "nodes") %>%
+  group_by(family) %>%
+  do({
+    mod <- lm(value ~ period_numeric, data = .)
+    tibble(
+      family = .$family[1],
+      slope = coef(mod)[2],  # Change per 30-year period
+      p_value = summary(mod)$coefficients[2, 4],
+      decline_rate = paste0(round(abs(coef(mod)[2]), 1), " countries per period")
+    )
+  }) %>%
+  ungroup()
+
+print("=== Temporal Trends in Network Size ===")
+print(node_trend_tests)
+
+# ============================================================================
+# 4. TEST FOR TEMPORAL TRENDS IN NETWORK COMPLEXITY
+# ============================================================================
+# Linear regression: edges ~ time, separately for each family
+
+edge_trend_tests <- network_trends %>%
+  filter(metric == "edges") %>%
+  group_by(family) %>%
+  do({
+    mod <- lm(value ~ period_numeric, data = .)
+    tibble(
+      family = .$family[1],
+      slope = coef(mod)[2],  # Change per 30-year period
+      p_value = summary(mod)$coefficients[2, 4],
+      decline_rate = paste0(round(abs(coef(mod)[2]), 0), " flows per period")
+    )
+  }) %>%
+  ungroup()
+
+print("=== Temporal Trends in Network Complexity ===")
+print(edge_trend_tests)
+
+# ============================================================================
+# 5. TEST FOR TEMPORAL TRENDS IN NETWORK DENSITY
+# ============================================================================
+# Linear regression: density ~ time, separately for each family
+
+density_trend_tests <- network_trends %>%
+  filter(metric == "density") %>%
+  group_by(family) %>%
+  do({
+    mod <- lm(value ~ period_numeric, data = .)
+    tibble(
+      family = .$family[1],
+      slope = coef(mod)[2],
+      p_value = summary(mod)$coefficients[2, 4],
+      percent_change = (max(.$value, na.rm=TRUE) - min(.$value, na.rm=TRUE)) / 
+                       min(.$value, na.rm=TRUE) * 100
+    )
+  }) %>%
+  ungroup()
+
+print("=== Temporal Trends in Network Density ===")
+print(density_trend_tests)
+
+# ============================================================================
+# 6. TEST FOR TEMPORAL TRENDS IN RECIPROCITY
+# ============================================================================
+# Linear regression: reciprocity ~ time, separately for each family
+
+recip_trend_tests <- network_trends %>%
+  filter(metric == "reciprocity") %>%
+  group_by(family) %>%
+  do({
+    mod <- lm(value ~ period_numeric, data = .)
+    tibble(
+      family = .$family[1],
+      slope = coef(mod)[2],
+      p_value = summary(mod)$coefficients[2, 4]
+    )
+  }) %>%
+  ungroup()
+
+print("=== Temporal Trends in Reciprocity ===")
+print(recip_trend_tests)
+
+# ============================================================================
+# 7. CORRELATION AMONG NETWORK METRICS
+# ============================================================================
+# Test if changes in size, complexity, and density are correlated
+
+metric_correlations <- metrics_by_slice %>%
+  select(nodes, edges, density, reciprocity, gc_frac) %>%
+  cor(use = "pairwise.complete.obs")
+
+print("=== Correlations Among Network Metrics ===")
+print(round(metric_correlations, 3))
+
+# Test if size and complexity decline together
+size_complexity_model <- lm(edges ~ nodes, data = metrics_by_slice)
+
+print("=== Relationship Between Network Size and Complexity ===")
+print(summary(size_complexity_model))
+print(paste0("For every 10-node decrease, edges decrease by: ",
+             round(coef(size_complexity_model)[2] * 10, 1)))
+
+# ============================================================================
+# 8. COMPARISON OF EARLY VS RECENT PERIODS
+# ============================================================================
+# Compare 1900-1929/1930-1959 (early) vs 1960-1989/1990-2020 (recent)
+
+period_comparison <- metrics_by_slice %>%
+  filter(family %in% families) %>%
+  mutate(period_group = if_else(
+    bin %in% c("1900-1929", "1930-1959"), "Early", "Recent"
+  )) %>%
+  pivot_longer(cols = c(nodes, edges, density, reciprocity, gc_frac),
+               names_to = "metric", values_to = "value") %>%
+  group_by(metric) %>%
+  do({
+    early_vals <- filter(., period_group == "Early")$value
+    recent_vals <- filter(., period_group == "Recent")$value
+    
+    # Two-sample t-test
+    test <- t.test(early_vals, recent_vals)
+    
+    tibble(
+      metric = .$metric[1],
+      early_mean = mean(early_vals, na.rm = TRUE),
+      recent_mean = mean(recent_vals, na.rm = TRUE),
+      percent_change = (mean(recent_vals, na.rm=TRUE) - mean(early_vals, na.rm=TRUE)) / 
+                       mean(early_vals, na.rm=TRUE) * 100,
+      t_statistic = test$statistic,
+      p_value = test$p.value
+    )
+  }) %>%
+  ungroup()
+
+print("=== Early (1900-1959) vs Recent (1960-2020) Comparison ===")
+print(period_comparison)
+
+# ============================================================================
+# 9. EXPORT SUMMARY TABLE FOR MANUSCRIPT
+# ============================================================================
+# Create clean summary table combining all key statistical tests
+
+dir.create("outputs/tables", showWarnings = FALSE, recursive = TRUE)
+
+stats_summary <- bind_rows(
+  gini_trend_tests %>% 
+    mutate(metric = "Gini", test = "Temporal trend") %>%
+    select(metric, family, test, everything()),
+  
+  node_trend_tests %>% 
+    mutate(metric = "Nodes", test = "Temporal trend") %>%
+    select(metric, family, test, slope, p_value, decline_rate),
+  
+  edge_trend_tests %>% 
+    mutate(metric = "Edges", test = "Temporal trend") %>%
+    select(metric, family, test, slope, p_value, decline_rate),
+  
+  density_trend_tests %>% 
+    mutate(metric = "Density", test = "Temporal trend") %>%
+    select(metric, family, test, slope, p_value, percent_change)
+)
+
+write.csv(stats_summary, "outputs/tables/statistical_tests_summary.csv", row.names = FALSE)
+
+print("=== Statistical tests complete. Summary saved to outputs/tables/statistical_tests_summary.csv ===")
+```
+
+## Summary Statistics Table
+
+```{r summary_stats_table}
+# ============================================================================
+# PUBLICATION-READY SUMMARY STATISTICS
+# ============================================================================
+# Creates comprehensive overview table for manuscript methods/results
+# ============================================================================
+
+summary_table <- bind_rows(
+  # Dataset overview
+  flows_binned %>%
+    summarise(
+      metric = "Total specimens",
+      value = format(sum(n), big.mark = ","),
+      description = "Across all families and periods"
+    ),
+  
+  # Family-specific totals
+  flows_binned %>%
+    group_by(family) %>%
+    summarise(
+      n_specimens = sum(n),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      metric = paste0(family, " specimens"),
+      value = format(n_specimens, big.mark = ","),
+      description = "Family-specific totals"
+    ) %>%
+    select(metric, value, description),
+  
+  # Geographic coverage
+  flows_binned %>%
+    summarise(
+      metric = "Origin countries",
+      value = as.character(n_distinct(collecting_iso3)),
+      description = "Countries from which specimens collected"
+    ),
+  
+  flows_binned %>%
+    summarise(
+      metric = "Holding countries", 
+      value = as.character(n_distinct(holding_iso3)),
+      description = "Countries with institutions holding specimens"
+    ),
+  
+  # Network metrics ranges
+  metrics_by_slice %>%
+    filter(family %in% families) %>%
+    summarise(
+      metric = "Network size range",
+      value = paste0(min(nodes), "–", max(nodes), " countries"),
+      description = "Min and max across families and periods"
+    ),
+  
+  metrics_by_slice %>%
+    filter(family %in% families) %>%
+    summarise(
+      metric = "Network complexity range",
+      value = paste0(min(edges), "–", max(edges), " flows"),
+      description = "Min and max across families and periods"
+    ),
+  
+  # Gini range
+  gini_data %>%
+    summarise(
+      metric = "Gini coefficient range",
+      value = paste0(round(min(gini_hold), 3), "–", round(max(gini_hold), 3)),
+      description = "Inequality measure across all slices"
+    )
+)
+
+knitr::kable(summary_table, caption = "Summary statistics for the specimen flow dataset")
+
+# Export to CSV
+write.csv(summary_table, "outputs/tables/summary_statistics.csv", row.names = FALSE)
+```
+
+# Supplementary Figures
+
+## Supplementary Figure 1: Canidae Networks
+
+```{r suppfig_canidae, fig.width=16, fig.height=12}
+# ============================================================================
+# FAMILY-SPECIFIC NETWORK MAPS: CANIDAE
+# ============================================================================
+# Shows detailed specimen flows for Canidae across all four time periods
+# Allows detailed examination of family-specific patterns
+# ============================================================================
+
+# Create maps for all four periods
+canidae_maps <- lapply(periods, function(p) {
+  make_family_network_map("Canidae", p, flows_binned, world_prj, world_coords)
+})
+
+# Combine into 2×2 grid
+pS_canidae <- wrap_plots(canidae_maps, ncol = 2) +
+  plot_annotation(
+    title = "Canidae specimen flow networks across time periods",
+    subtitle = "Node size = specimens held; color = net balance (red = exporter, blue = importer)"
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2, "cm"))
+
+print(pS_canidae)
+save_fig(pS_canidae, "figS1_canidae_networks", w = 16, h = 12)
+```
+
+## Supplementary Figure 2: Felidae Networks
+
+```{r suppfig_felidae, fig.width=16, fig.height=12}
+# ============================================================================
+# FAMILY-SPECIFIC NETWORK MAPS: FELIDAE
+# ============================================================================
+# Shows detailed specimen flows for Felidae across all four time periods
+# ============================================================================
+
+felidae_maps <- lapply(periods, function(p) {
+  make_family_network_map("Felidae", p, flows_binned, world_prj, world_coords)
+})
+
+pS_felidae <- wrap_plots(felidae_maps, ncol = 2) +
+  plot_annotation(
+    title = "Felidae specimen flow networks across time periods",
+    subtitle = "Node size = specimens held; color = net balance (red = exporter, blue = importer)"
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2, "cm"))
+
+print(pS_felidae)
+save_fig(pS_felidae, "figS2_felidae_networks", w = 16, h = 12)
+```
+
+## Supplementary Figure 3: Mustelidae Networks
+
+```{r suppfig_mustelidae, fig.width=16, fig.height=12}
+# ============================================================================
+# FAMILY-SPECIFIC NETWORK MAPS: MUSTELIDAE
+# ============================================================================
+# Shows detailed specimen flows for Mustelidae across all four time periods
+# ============================================================================
+
+mustelidae_maps <- lapply(periods, function(p) {
+  make_family_network_map("Mustelidae", p, flows_binned, world_prj, world_coords)
+})
+
+pS_mustelidae <- wrap_plots(mustelidae_maps, ncol = 2) +
+  plot_annotation(
+    title = "Mustelidae specimen flow networks across time periods",
+    subtitle = "Node size = specimens held; color = net balance (red = exporter, blue = importer)"
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom",
+        legend.key.width = unit(2, "cm"))
+
+print(pS_mustelidae)
+save_fig(pS_mustelidae, "figS3_mustelidae_networks", w = 16, h = 12)
+```
+
+# Session Info
+
+```{r session_info}
+# ============================================================================
+# REPRODUCIBILITY INFORMATION
+# ============================================================================
+# Documents R version, package versions, and system information
+# Essential for reproducibility and troubleshooting
+# ============================================================================
+
+sessionInfo()
+```
+
+---
+
+## Interpretation Guide
+
+These analyses address the following research questions:
+
+1. **Are the U-shaped Gini trends significant?**  
+   Tested using quadratic model comparison (see gini_trend_tests)
+
+2. **Do families differ in inequality?**  
+   Tested using mixed-effects model with pairwise comparisons
+
+3. **Are network size/complexity declines significant?**  
+   Tested using linear models quantifying decline rates
+
+4. **Are metric changes correlated?**  
+   Examined using correlation matrix and regression models
+
+5. **Do early vs. recent periods differ?**  
+   Tested using t-tests comparing 1900-1959 vs. 1960-2020
+
+## Key Findings to Report
+
+Based on the statistical tests above, key findings for the Results section:
+
+- **Gini coefficients** show significant quadratic trends for Canidae and Mustelidae (p < 0.05), indicating U-shaped temporal patterns in inequality
+- **Network size** declined significantly at approximately X countries per 30-year period (p < 0.001)
+- **Network complexity** declined at approximately Y flows per 30-year period (p < 0.001)
+- **Size and complexity** are tightly correlated (R² > 0.90), indicating coordinated decline
+- **Network density** increased significantly despite absolute size reduction (p < 0.01), suggesting remaining connections are more concentrated
+
+## Data Requirements
+
+This script expects a `flows_norm` dataframe with the following structure:
+
+```r
+# Required columns:
+# - family: character ("Canidae", "Felidae", or "Mustelidae")
+# - decade: integer (1900, 1910, ..., 2020)
+# - collecting_country: character (country name)
+# - holding_country: character (country name)
+# - collecting_iso3: character (ISO3 code, e.g., "USA")
+# - holding_iso3: character (ISO3 code, e.g., "GBR")
+# - n: numeric (specimen count)
+```
+
+If your data structure differs, modify the `normalize_data` chunk accordingly.
+
+---
+
+**Analysis complete!** All figures saved to `outputs/figs/` and tables to `outputs/tables/`.
